@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mufti-scraper"
+version = "0.1.0"
+description = "Polite multi-source Islamic fatwa scraper for educational indexing"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
+    "sqlalchemy>=2.0.0",
+    "urllib3>=2.0.0",
+    "trafilatura>=1.6.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "cachetools>=5.5.0",
+    "aiosqlite>=0.20.0",
+]
+
+[project.optional-dependencies]
+pdf = ["pdfplumber>=0.10.0"]
+postgres = ["asyncpg>=0.30.0"]
+dev = ["pytest>=7.4.0", "httpx>=0.28.0"]
+
+[project.scripts]
+mufti-scrape = "mufti_scraper.cli:main"
+mufti-api = "mufti_api.main:run"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mufti_scraper*", "mufti_api*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
