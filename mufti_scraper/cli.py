@@ -74,10 +74,13 @@ def run_scraper(
                     logger.info("Skipping (robots): %s", url)
                     continue
                 try:
-                    r = client.get(url)
-                    r.raise_for_status()
-                    encoding = r.encoding or r.apparent_encoding or "utf-8"
-                    html = r.content.decode(encoding, errors="replace")
+                    if getattr(src, "has_custom_fetcher", False):
+                        html = src.fetch_page(url)
+                    else:
+                        r = client.get(url)
+                        r.raise_for_status()
+                        encoding = r.encoding or r.apparent_encoding or "utf-8"
+                        html = r.content.decode(encoding, errors="replace")
                 except Exception as e:
                     stats["failed"] += 1
                     repo.log_error(session, url, src.name, f"fetch: {e}")
@@ -113,6 +116,13 @@ def run_scraper(
         session.rollback()
         raise
     finally:
+        for src in sources:
+            closer = getattr(src, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception as e:
+                    logger.debug("Source close failed for %s: %s", src.name, e)
         session.close()
 
     return stats

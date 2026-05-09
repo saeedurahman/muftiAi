@@ -77,6 +77,14 @@ def test_search_pagination_and_keyword(seeded_db_url: str):
         assert d2["total"] >= 1
         assert any("نماز" in (x.get("question") or "") for x in d2["items"])
 
+        r3 = client.get(
+            "/search",
+            params=[("source", "TestSource"), ("source", "MissingSource")],
+        )
+        assert r3.status_code == 200
+        d3 = r3.json()
+        assert d3["total"] == 2
+
 
 def test_fatwa_by_id_404(seeded_db_url: str):
     settings = Settings(
@@ -147,3 +155,127 @@ def test_invalid_page_size(seeded_db_url: str):
     with TestClient(app) as client:
         r = client.get("/search", params={"page_size": 500})
         assert r.status_code == 400
+
+
+def test_stats_sources_categories_endpoints(seeded_db_url: str):
+    settings = Settings(
+        database_url=seeded_db_url,
+        cors_origins=["*"],
+        api_key=None,
+        search_cache_ttl_s=60,
+        search_cache_max_entries=32,
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        stats = client.get("/stats")
+        assert stats.status_code == 200
+        d = stats.json()
+        assert d["total_fatwas"] == 2
+        assert d["total_sources"] == 1
+        assert d["total_categories"] == 2
+        assert d["sources"][0]["name"] == "TestSource"
+        assert d["sources"][0]["count"] == 2
+
+        sources = client.get("/sources")
+        assert sources.status_code == 200
+        ds = sources.json()
+        assert len(ds) == 1
+        assert ds[0]["source"] == "TestSource"
+        assert ds[0]["count"] == 2
+
+        categories = client.get("/categories", params={"limit": 1})
+        assert categories.status_code == 200
+        dc = categories.json()
+        assert len(dc) == 1
+        assert dc[0]["count"] == 1
+
+
+def test_questions_crud_flow(seeded_db_url: str):
+    settings = Settings(
+        database_url=seeded_db_url,
+        cors_origins=["*"],
+        api_key=None,
+        search_cache_ttl_s=60,
+        search_cache_max_entries=32,
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        created = client.post(
+            "/questions",
+            json={
+                "question_text": "نماز کے بعد دعا کے آداب کیا ہیں؟ براہ کرم تفصیل سے رہنمائی فرمائیں۔",
+                "contact_info": "user@example.com",
+                "language": "ur",
+            },
+        )
+        assert created.status_code == 200
+        row = created.json()
+        qid = row["id"]
+        assert row["status"] == "pending"
+        assert row["priority"] == "normal"
+
+        listing = client.get("/admin/questions", params={"status": "pending"})
+        assert listing.status_code == 200
+        ld = listing.json()
+        assert ld["total"] >= 1
+        assert any(item["id"] == qid for item in ld["items"])
+
+        detail = client.get(f"/admin/questions/{qid}")
+        assert detail.status_code == 200
+        assert detail.json()["id"] == qid
+
+        st = client.patch(
+            f"/admin/questions/{qid}/status",
+            json={"status": "reviewing", "admin_notes": "Assigned to mufti"},
+        )
+        assert st.status_code == 200
+        assert st.json()["status"] == "reviewing"
+
+        ans = client.patch(
+            f"/admin/questions/{qid}/answer",
+            json={"answer_text": "بعد از نماز دعا کرنا جائز ہے۔"},
+        )
+        assert ans.status_code == 200
+        assert ans.json()["status"] == "answered"
+        assert ans.json()["answer_text"] == "بعد از نماز دعا کرنا جائز ہے۔"
+
+        rej = client.delete(f"/admin/questions/{qid}")
+        assert rej.status_code == 200
+        assert rej.json()["message"] == "Question rejected"
+
+
+def test_search_miss_logging_and_admin_endpoints(seeded_db_url: str):
+    settings = Settings(
+        database_url=seeded_db_url,
+        cors_origins=["*"],
+        api_key=None,
+        search_cache_ttl_s=60,
+        search_cache_max_entries=32,
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        # This should log a miss in background (total == 0).
+        r = client.get("/search", params={"query": "this-query-should-not-match-anything"})
+        assert r.status_code == 200
+        assert r.json()["total"] == 0
+
+        misses = client.get("/admin/search-misses")
+        assert misses.status_code == 200
+        md = misses.json()
+        assert md["total"] >= 1
+        first = md["items"][0]
+        miss_id = first["id"]
+        assert first["resolved"] is False
+
+        stats = client.get("/admin/search-misses/stats")
+        assert stats.status_code == 200
+        sd = stats.json()
+        assert sd["total_misses"] >= 1
+        assert sd["unresolved"] >= 1
+
+        resolved = client.patch(f"/admin/search-misses/{miss_id}/resolve")
+        assert resolved.status_code == 200
+        assert resolved.json()["resolved"] is True
+
+        unresolved_list = client.get("/admin/search-misses", params={"resolved": False})
+        assert unresolved_list.status_code == 200

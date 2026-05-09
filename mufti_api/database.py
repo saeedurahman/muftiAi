@@ -6,6 +6,7 @@ import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+from sqlalchemy import text
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -73,3 +74,46 @@ async def create_tables_if_needed():
         return
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # SQLite-only FTS5 setup for fast search. App should keep working if this fails.
+        try:
+            if _engine.url.get_backend_name() == "sqlite":
+                await conn.execute(
+                    text(
+                        """
+                        CREATE VIRTUAL TABLE IF NOT EXISTS fatwas_fts
+                        USING fts5(
+                          question,
+                          answer,
+                          category,
+                          content=fatwas,
+                          content_rowid=id,
+                          tokenize='unicode61'
+                        );
+                        """
+                    )
+                )
+                count = (
+                    await conn.execute(text("SELECT COUNT(*) FROM fatwas_fts"))
+                ).scalar_one()
+                if int(count) == 0:
+                    await conn.execute(
+                        text(
+                            """
+                            INSERT INTO fatwas_fts(rowid, question, answer, category)
+                            SELECT id, question, answer, category FROM fatwas;
+                            """
+                        )
+                    )
+                await conn.execute(
+                    text(
+                        """
+                        CREATE TRIGGER IF NOT EXISTS fatwas_ai
+                        AFTER INSERT ON fatwas BEGIN
+                          INSERT INTO fatwas_fts(rowid, question, answer, category)
+                          VALUES (new.id, new.question, new.answer, new.category);
+                        END;
+                        """
+                    )
+                )
+        except Exception as e:
+            logger.warning("FTS5 setup failed; falling back to LIKE search: %s", e)

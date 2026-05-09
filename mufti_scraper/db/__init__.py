@@ -1,3 +1,37 @@
-from mufti_scraper.db.models import Base, Fatwa, ScrapeError
+from mufti_scraper.db.models import (
+    AITrial,
+    Base,
+    ChatMessage,
+    ChatSession,
+    Donation,
+    FatwaSummary,
+    FatwaTranslation,
+    Fatwa,
+    Mufti,
+    MuftiPayment,
+    Question,
+    ScrapeError,
+    SearchMiss,
+    RelatedFatwaCache,
+    Subscription,
+    User,
+)
 
-__all__ = ["Base", "Fatwa", "ScrapeError"]
+__all__ = [
+    "Base",
+    "ChatSession",
+    "ChatMessage",
+    "Fatwa",
+    "Question",
+    "ScrapeError",
+    "SearchMiss",
+    "User",
+    "Mufti",
+    "MuftiPayment",
+    "Subscription",
+    "AITrial",
+    "Donation",
+    "FatwaTranslation",
+    "FatwaSummary",
+    "RelatedFatwaCache",
+]

@@ -26,6 +26,7 @@ Flutter example (package:http)::
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 
@@ -35,7 +36,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from mufti_api.config import Settings
 from mufti_api.database import create_tables_if_needed, dispose_engine, init_engine
-from mufti_api.routers import fatwas
+from mufti_api.routers import auth, chat, donations, fatwas, muftis, questions, scraper
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -50,6 +51,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             maxsize=resolved.search_cache_max_entries,
             ttl=resolved.search_cache_ttl_s,
         )
+        app.state.scrape_status = {
+            "is_running": False,
+            "task_id": None,
+            "started_at": None,
+            "sources": [],
+            "limit": 0,
+            "progress": {
+                "inserted": 0,
+                "skipped": 0,
+                "failed": 0,
+                "current_source": "",
+            },
+            "completed_at": None,
+            "error": None,
+        }
+        app.state.scrape_history = []
+        app.state.scrape_lock = asyncio.Lock()
         yield
         await dispose_engine()
 
@@ -65,7 +83,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             CORSMiddleware,
             allow_origins=["*"],
             allow_credentials=False,
-            allow_methods=["GET", "OPTIONS"],
+            allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=["*"],
         )
     else:
@@ -73,11 +91,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             CORSMiddleware,
             allow_origins=resolved.cors_origins,
             allow_credentials=True,
-            allow_methods=["GET", "OPTIONS"],
+            allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=["*"],
         )
 
     app.include_router(fatwas.router)
+    app.include_router(questions.router)
+    app.include_router(scraper.router)
+    app.include_router(auth.router)
+    app.include_router(donations.router)
+    app.include_router(chat.router)
+    app.include_router(muftis.router)
     return app
 
 
