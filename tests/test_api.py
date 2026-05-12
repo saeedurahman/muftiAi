@@ -244,6 +244,66 @@ def test_questions_crud_flow(seeded_db_url: str):
         assert rej.json()["message"] == "Question rejected"
 
 
+def test_question_upload_answer_and_answer_from_text(seeded_db_url: str):
+    settings = Settings(
+        database_url=seeded_db_url,
+        cors_origins=["*"],
+        api_key=None,
+        search_cache_ttl_s=60,
+        search_cache_max_entries=32,
+    )
+    app = create_app(settings)
+    long_txt = (
+        "بسم اللہ الرحمن الرحیم۔ یہ ایک طویل جواب ہے جو پچاس حروف سے زیادہ ہونا چاہیے۔ "
+        * 2
+    )
+    with TestClient(app) as client:
+        created = client.post(
+            "/questions",
+            json={
+                "question_text": "نماز کے بعد دعا کے آداب کیا ہیں؟ براہ کرم تفصیل سے رہنمائی فرمائیں۔",
+                "contact_info": None,
+                "language": "ur",
+            },
+        )
+        assert created.status_code == 200
+        qid = created.json()["id"]
+
+        up = client.post(
+            f"/questions/{qid}/upload-answer",
+            files={"file": ("answer.txt", long_txt.encode("utf-8"), "text/plain")},
+        )
+        assert up.status_code == 200
+        ud = up.json()
+        assert ud["question_id"] == qid
+        assert ud["status"] == "answered"
+        assert ud["extracted_length"] >= 50
+        assert "message" in ud
+
+        bad = client.post(
+            f"/questions/{qid}/upload-answer",
+            files={"file": ("x.doc", b"hi", "application/msword")},
+        )
+        assert bad.status_code == 400
+        assert bad.json()["detail"] == "Only PDF or TXT files allowed"
+
+        created2 = client.post(
+            "/questions",
+            json={
+                "question_text": "زکوٰۃ کے مسائل میں کیا فرق ہے؟ تفصیل سے وضاحت فرمائیں۔",
+                "contact_info": None,
+                "language": "ur",
+            },
+        )
+        qid2 = created2.json()["id"]
+        paste = client.post(
+            f"/questions/{qid2}/answer-from-text",
+            json={"answer_text": long_txt},
+        )
+        assert paste.status_code == 200
+        assert paste.json()["question_id"] == qid2
+
+
 def test_search_miss_logging_and_admin_endpoints(seeded_db_url: str):
     settings = Settings(
         database_url=seeded_db_url,

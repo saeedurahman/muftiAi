@@ -1,0 +1,43 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Local environment
+.env
+*.env.local
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Local SQLite databases (DO NOT commit production data)
+fatawa.db
+fatawa.backup.db
+*.db-journal
+
+# Cookie / credential files (contain secrets — never commit)
+deoband_cookies.json
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

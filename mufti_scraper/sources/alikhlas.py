@@ -13,7 +13,7 @@ import re
 import time
 from urllib.parse import urljoin
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from mufti_scraper.cleaning import canonical_url, html_to_clean_text, normalize_text
 from mufti_scraper.http_client import PoliteHttpClient
@@ -37,6 +37,38 @@ _HOMEPAGE_PATH_SUFFIXES: tuple[str, ...] = (
     "/default.aspx",
     "/index.aspx",
     "/home.aspx",
+)
+
+# Selectors confirmed via browser inspection of alikhlasonline.com fatawa.
+_NOISE_SELECTOR = (
+    ".hidden-print, .col-md-4.text-center.hidden-print, "
+    ".container.hidden-print, footer, header, nav, "
+    "script, style, noscript"
+)
+
+# Main content containers, tried in order.
+_CONTAINER_SELECTORS: tuple[str, ...] = (
+    "#printthis",
+    ".section-to-print",
+    ".col-md-8.minHeight",
+)
+
+# Detail anchor pattern. We collect only ``detail.aspx?id=`` URLs because the
+# legacy ``article.aspx?id=`` pages use a different layout that doesn't carry
+# the confirmed ``<b class='text-danger'>سوال:</b>`` markers. Restricting the
+# filter keeps URL collection aligned with what ``parse_page`` can extract.
+_DETAIL_HREF_RE = re.compile(r"detail\.aspx\?id=", re.I)
+
+# Question / answer label markers carried inside a leading ``<b
+# class='text-danger'>`` element on each fatwa paragraph.
+_Q_LABEL = "سوال"
+_A_LABEL = "جواب"
+
+# Breadcrumb root labels that should be ignored as categories. The site
+# breadcrumb on detail pages typically contains a single anchor pointing at
+# the homepage, so accepting it would mislabel every fatwa as "Home".
+_GENERIC_CATEGORY_TERMS: frozenset[str] = frozenset(
+    {"home", "index", "main", "صفحہ اول", "خانہ"}
 )
 
 
@@ -73,7 +105,10 @@ class AlIkhlasSource:
         seen: set[str] = set()
         out: list[str] = []
 
-        list_pages: list[str] = [canonical_url(f"{BASE}/articles/")]
+        # ``/articles/`` is mined below for category links but never walked
+        # for fatwa anchors — its links use the legacy ``article.aspx`` shape
+        # that ``parse_page`` cannot reliably extract.
+        list_pages: list[str] = []
 
         # Discover extra category links from articles index. These are
         # explicitly linked from the site so we trust them without HEAD.
@@ -165,7 +200,7 @@ class AlIkhlasSource:
 
             for a in soup.select("a[href]"):
                 href = a.get("href") or ""
-                if "article.aspx" not in href.lower():
+                if not _DETAIL_HREF_RE.search(href):
                     continue
                 full = canonical_url(urljoin(BASE, href))
                 # Cross-category dedupe: an article linked from two
@@ -186,34 +221,89 @@ class AlIkhlasSource:
     def parse_page(self, html: str, url: str) -> ParsedFatwa | None:
         soup = BeautifulSoup(html, "lxml")
 
-        # Targeted question/answer selectors first; fall back to the older
-        # generic extraction when this site doesn't use a known class.
-        q_text = _select_first_text(
-            soup,
-            (".question", "#question", ".sawal", "[class*='question']"),
-        )
-        a_text = _select_first_text(
-            soup,
-            (".answer", "#answer", ".jawab", "[class*='answer']"),
-        )
+        # Breadcrumb sits inside ``nav`` on this template, so capture it
+        # *before* the noise stripper drops nav/header/footer blocks.
+        cat_el = soup.select_one(".breadcrumb a:last-of-type")
+        breadcrumb_cat = normalize_text(cat_el.get_text()) if cat_el else ""
 
+        _strip_noise(soup)
+
+        # Locate the printable fatwa block; fall back to the full document
+        # so legacy templates without the print container still parse.
+        container: Tag | BeautifulSoup = soup
+        for sel in _CONTAINER_SELECTORS:
+            found = soup.select_one(sel)
+            if found is not None:
+                container = found
+                break
+
+        q_text, a_text = _extract_label_qa(container)
+
+        # Legacy fallbacks: try previously-supported generic selectors so we
+        # don't regress if a fatwa page uses an older template.
+        if not q_text:
+            q_text = _select_first_text(
+                container,
+                (".question", "#question", ".sawal", "[class*='question']"),
+            )
+        if not a_text:
+            a_text = _select_first_text(
+                container,
+                (".answer", "#answer", ".jawab", "[class*='answer']"),
+            )
         if not q_text:
             h = soup.select_one("h1, h2, h3")
             q_text = normalize_text(h.get_text()) if h else ""
         if not a_text:
-            main = soup.select_one("#main, main, .content, form, body") or soup.body
-            a_text = html_to_clean_text(str(main)) if main else ""
+            target = (
+                container
+                if isinstance(container, Tag)
+                else (
+                    soup.select_one("#main, main, .content, form, body") or soup.body
+                )
+            )
+            a_text = html_to_clean_text(str(target)) if target is not None else ""
 
-        if not a_text or len(a_text) < 80:
-            return None
+        q_text = _dedupe_lines(q_text)
+        a_text = _dedupe_lines(a_text)
 
         canonical = canonical_url(url)
+        category: str | None = None
+        if _is_meaningful_category(breadcrumb_cat):
+            category = breadcrumb_cat[:512]
+        if not category:
+            listing_cat = self._category_by_url.get(canonical)
+            if _is_meaningful_category(listing_cat):
+                category = (listing_cat or "")[:512]
+
+        if (
+            not q_text
+            or not a_text
+            or len(q_text.strip()) < 20
+            or len(a_text.strip()) < 50
+            or q_text == a_text
+        ):
+            logger.debug(
+                "AlIkhlas parse failed: url=%s q=%d a=%d",
+                url,
+                len(q_text or ""),
+                len(a_text or ""),
+            )
+            return None
+
+        logger.debug(
+            "AlIkhlas parsed OK: url=%s cat=%s q=%d a=%d",
+            url,
+            category,
+            len(q_text),
+            len(a_text),
+        )
         return ParsedFatwa(
-            question=q_text or a_text[:400],
+            question=q_text,
             answer=a_text,
             source=SOURCE_NAME,
             url=canonical,
-            category=self._category_by_url.get(canonical),
+            category=category,
             date=None,
         )
 
@@ -272,13 +362,85 @@ def _find_next_page_urls(soup: BeautifulSoup, current_url: str) -> list[str]:
     return out
 
 
-def _select_first_text(soup: BeautifulSoup, selectors: tuple[str, ...]) -> str:
+def _select_first_text(
+    root: Tag | BeautifulSoup, selectors: tuple[str, ...]
+) -> str:
     """Return normalized text for the first selector that matches non-empty content."""
     for sel in selectors:
-        el = soup.select_one(sel)
+        el = root.select_one(sel)
         if el is None:
             continue
         t = normalize_text(el.get_text())
         if t:
             return t
     return ""
+
+
+def _strip_noise(soup: BeautifulSoup) -> None:
+    """Remove sidebars, share widgets, print buttons, and chrome."""
+    for tag in soup.select(_NOISE_SELECTOR):
+        tag.decompose()
+
+
+def _is_meaningful_category(text: str | None) -> bool:
+    """True when ``text`` looks like a real fatwa category, not a root link."""
+    if not text:
+        return False
+    t = text.strip()
+    if len(t) < 4:
+        return False
+    if t.lower() in _GENERIC_CATEGORY_TERMS:
+        return False
+    return True
+
+
+def _dedupe_lines(text: str) -> str:
+    """Drop duplicate non-empty lines while preserving original order."""
+    if not text:
+        return ""
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if line and line not in seen:
+            seen.add(line)
+            out.append(line)
+    return "\n".join(out)
+
+
+def _extract_label_qa(container: Tag | BeautifulSoup) -> tuple[str, str]:
+    """Extract (question, answer) using the ``UrduTextNafeesPara`` markup.
+
+    The fatwa page wraps each section in ``<p class='UrduTextNafeesPara'>``
+    with a leading ``<b class='text-danger'>سوال:</b>`` or
+    ``<b class='text-danger'>جواب:</b>`` label. We decompose the bold label
+    in-place, then read the remaining paragraph text. For the answer, all
+    following ``<p>`` siblings are concatenated since longer fatawa span
+    multiple paragraphs.
+    """
+    q_text = ""
+    a_text = ""
+
+    paragraphs = container.find_all("p", class_="UrduTextNafeesPara")
+    for p in paragraphs:
+        bold = p.find("b", class_="text-danger")
+        if bold is None:
+            continue
+        label = bold.get_text() or ""
+
+        if not q_text and _Q_LABEL in label:
+            bold.decompose()
+            q_text = normalize_text(p.get_text())
+        elif not a_text and _A_LABEL in label:
+            bold.decompose()
+            answer_parts = [normalize_text(p.get_text())]
+            for sibling in p.find_next_siblings("p"):
+                t = normalize_text(sibling.get_text())
+                if t and len(t) > 5:
+                    answer_parts.append(t)
+            a_text = "\n\n".join(part for part in answer_parts if part)
+
+        if q_text and a_text:
+            break
+
+    return q_text, a_text

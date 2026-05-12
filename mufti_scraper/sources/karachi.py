@@ -1,20 +1,25 @@
 """
-Darul Uloom Karachi scraper (WordPress-first strategy).
+Jamia Darul Uloom Karachi scraper for darulifta.info.
 
-This source no longer uses generic BFS over site pages because that primarily
-found institutional content. Instead it targets WordPress post content via:
+The old darululoomkarachi.edu.pk source returns 403, so this source targets:
 
-1) WP REST API: /wp-json/wp/v2/posts?per_page=100&page=N
-2) Category listing fallback: ?cat=<id> plus pagination links
+* Listing: https://darulifta.info/d/darululoomkarachi?page={N}
+* Detail:  https://darulifta.info/d/darululoomkarachi/fatwa/{short_id}/{slug}
+
+Detail pages embed the answer as a PDF.js iframe; text answers are extracted
+from the linked PDF with pdfplumber.
 """
 
 from __future__ import annotations
 
+import io
 import logging
 import re
-from urllib.parse import parse_qs, urljoin, urlparse
+import time
+import urllib.parse
+from urllib.parse import urljoin
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
 from mufti_scraper.cleaning import canonical_url, normalize_text
 from mufti_scraper.http_client import PoliteHttpClient
@@ -23,20 +28,44 @@ from mufti_scraper.sources.base import ParsedFatwa
 
 logger = logging.getLogger(__name__)
 
-BASE = "https://darululoomkarachi.edu.pk"
-SOURCE_NAME = "Darul Uloom Karachi"
-FATWA_CATS: list[int] = [1, 2, 3, 4, 28, 30, 32, 45]
-_WP_POST_LINK_RE = re.compile(r"[?&]p=\d+", re.I)
+# pdfplumber uses pdfminer internally, which can emit extremely noisy DEBUG
+# traces under the scraper's global logging config.
+for _noisy in (
+    "pdfminer",
+    "pdfminer.psparser",
+    "pdfminer.pdfinterp",
+    "pdfminer.cmapdb",
+    "pdfplumber",
+):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+BASE_URL = "https://darulifta.info"
+LISTING_BASE = "https://darulifta.info/d/darululoomkarachi"
+SOURCE_NAME = "Jamia Darul Uloom Karachi"
+MAX_PAGES = 42
+PER_PAGE = 25
+
+_FATWA_LINK_RE = re.compile(r"/d/darululoomkarachi/fatwa/")
+_PDF_FILE_RE = re.compile(r"[?&]file=([^&]+)")
+_DATE_RE = re.compile(r"\d{2}[-/]\d{2}[-/]\d{4}|\d{4}[-/]\d{2}[-/]\d{2}")
+_FATWA_NUMBER_RE = re.compile(r"فتویٰ\s*نمبر[:\s]+([0-9/]+)")
+_ARABIC_SCRIPT_RE = re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+_NOISE_SELECTOR = (
+    "header, footer, nav, script, style, noscript, "
+    "._m_widget, div.grid.grid-cols-1.md\\:grid-cols-2"
+)
 
 
 class KarachiSource:
     name = "karachi"
 
     def __init__(self, max_depth: int = 3) -> None:
-        # Kept only for backward compatibility with registry wiring.
-        # New WordPress-based strategy no longer uses crawl depth.
+        # Kept for registry compatibility. The darulifta.info source uses a
+        # fixed paginated listing instead of depth-based crawling.
         _ = max_depth
-        self._api_post_cache: dict[str, ParsedFatwa] = {}
+        self._client: PoliteHttpClient | None = None
 
     def iter_detail_urls(
         self,
@@ -44,262 +73,300 @@ class KarachiSource:
         robots: RobotsCache,
         limit: int | None,
     ) -> list[str]:
-        return self.collect_urls(client, robots, limit)
-
-    def collect_urls(
-        self,
-        client: PoliteHttpClient,
-        robots: RobotsCache,
-        limit: int | None,
-    ) -> list[str]:
-        """Collect Karachi post URLs via WP API first, category crawl second."""
+        """Collect detail URLs from the confirmed darulifta.info listing."""
+        self._client = client
         seen: set[str] = set()
         out: list[str] = []
+        max_urls = limit or 99999
 
-        # STEP 1: WordPress REST API (preferred).
-        api_endpoints = (
-            f"{BASE}/wp-json/wp/v2/posts",
-            f"{BASE}/index.php?rest_route=/wp/v2/posts",
-        )
-        for api_endpoint in api_endpoints:
-            for page in range(1, 101):
-                if limit is not None and len(out) >= limit:
-                    break
-                api_url = f"{api_endpoint}&per_page=100&page={page}" if "rest_route=" in api_endpoint else f"{api_endpoint}?per_page=100&page={page}"
-                if not robots.can_fetch(api_url):
-                    break
-                try:
-                    r = client.get(api_url)
-                    if r.status_code == 404:
-                        break
-                    r.raise_for_status()
-                except Exception as e:
-                    logger.info("Karachi WP-API page %d failed: %s", page, e)
-                    break
-
-                try:
-                    posts = r.json()
-                except ValueError as e:
-                    logger.info("Karachi WP-API decode failed page %d: %s", page, e)
-                    break
-                if not isinstance(posts, list):
-                    break
-
-                logger.info("Karachi WP-API: page %d -> %d posts", page, len(posts))
-                if not posts:
-                    break
-
-                new_count = 0
-                for post in posts:
-                    if not isinstance(post, dict):
-                        continue
-                    link = normalize_text(str(post.get("link", "")))
-                    if not link:
-                        continue
-                    full = canonical_url(link)
-                    if full in seen:
-                        continue
-                    parsed = self._parse_wp_api_post(post)
-                    if parsed is None:
-                        continue
-                    self._api_post_cache[full] = parsed
-                    seen.add(full)
-                    out.append(full)
-                    new_count += 1
-                    if limit is not None and len(out) >= limit:
-                        break
-                if new_count == 0:
-                    break
-            if out:
+        for page_num in range(1, MAX_PAGES + 1):
+            if len(out) >= max_urls:
                 break
 
-        if out:
-            return out[:limit] if limit else out
-
-        # STEP 2: Category crawl fallback.
-        for cat_id in FATWA_CATS:
-            if limit is not None and len(out) >= limit:
+            listing_url = (
+                LISTING_BASE
+                if page_num == 1
+                else f"{LISTING_BASE}?page={page_num}"
+            )
+            if not robots.can_fetch(listing_url):
+                logger.warning("Karachi robots blocked: %s", listing_url)
                 break
-            next_pages: list[str] = [canonical_url(f"{BASE}/?cat={cat_id}")]
-            visited: set[str] = set()
-            while next_pages and (limit is None or len(out) < limit):
-                page_url = next_pages.pop(0)
-                if page_url in visited:
-                    continue
-                visited.add(page_url)
-                if not robots.can_fetch(page_url):
-                    continue
-                try:
-                    r = client.get(page_url)
-                    r.raise_for_status()
-                except Exception as e:
-                    logger.warning("Karachi cat=%s page=%s: %s", cat_id, page_url, e)
-                    continue
-                soup = BeautifulSoup(r.text, "lxml")
 
-                for a in soup.select("a[href]"):
-                    href = a.get("href") or ""
-                    full = canonical_url(urljoin(page_url, href))
-                    if not _is_wp_post_link(full):
-                        continue
-                    if full in seen:
-                        continue
-                    seen.add(full)
-                    out.append(full)
-                    if limit is not None and len(out) >= limit:
-                        break
+            try:
+                r = client.get(listing_url)
+                r.raise_for_status()
+            except Exception as e:
+                logger.warning("Karachi listing page=%d failed: %s", page_num, e)
+                break
 
-                for nxt in _find_next_page_urls(soup, page_url):
-                    if nxt not in visited:
-                        next_pages.append(nxt)
+            soup = BeautifulSoup(r.text, "lxml")
+            links: list[str] = []
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if not _FATWA_LINK_RE.search(href):
+                    continue
+                canon = canonical_url(urljoin(BASE_URL, href))
+                if canon in seen:
+                    continue
+                seen.add(canon)
+                links.append(canon)
 
-        return out[:limit] if limit else out
+            if not links:
+                logger.info(
+                    "Karachi: page=%d returned 0 links - stopping", page_num
+                )
+                break
+
+            for url in links:
+                if len(out) >= max_urls:
+                    break
+                out.append(url)
+
+            logger.info(
+                "Karachi: page=%d links=%d total=%d",
+                page_num,
+                len(links),
+                len(out),
+            )
+
+            if page_num < MAX_PAGES and len(out) < max_urls:
+                time.sleep(1.5)
+
+        return out
 
     def parse_page(self, html: str, url: str) -> ParsedFatwa | None:
-        cached = self._api_post_cache.get(canonical_url(url))
-        if cached is not None:
-            return cached
-
         soup = BeautifulSoup(html, "lxml")
+        _strip_noise(soup)
 
-        # STEP 1: Remove noise/chrome.
-        for tag in soup.select(
-            "nav, header, footer, .sidebar, .widget-area, .comments-area, script, style, .wp-block-navigation"
-        ):
-            tag.decompose()
+        q_text = _extract_question(soup)
+        pdf_url = self._get_pdf_url(soup, BASE_URL)
 
-        # STEP 2: Title as base question.
-        title_el = soup.select_one(
-            "h1.entry-title, h1.post-title, h1.wp-block-post-title, h1"
-        )
-        q_text = normalize_text(title_el.get_text()) if title_el else ""
         a_text = ""
+        if pdf_url:
+            logger.debug("Karachi: fetching PDF %s", pdf_url)
+            a_text = self._extract_pdf_text(pdf_url, self._client)
+        else:
+            logger.warning("Karachi: no PDF found for %s", url)
 
-        # STEP 3: Main content extraction and optional sawal/jawab split.
-        content_el = soup.select_one(
-            ".entry-content, .post-content, .wp-block-post-content, article .content, #content article, .site-main article"
-        )
-        if content_el:
-            q_split, a_split = _split_sawal_jawab(content_el)
-            if q_split and a_split:
-                q_text = q_split
-                a_text = a_split
-            else:
-                paragraphs = []
-                for p in content_el.find_all(["p", "div"]):
-                    t = normalize_text(p.get_text())
-                    if len(t) > 20:
-                        paragraphs.append(t)
-                a_text = normalize_text("\n\n".join(paragraphs))
+        category = _extract_category(soup)
+        date_text = _extract_date(soup)
+        fatwa_num = _extract_fatwa_number(soup)
 
-        # STEP 4: Category extraction.
-        cat_el = soup.select_one(".cat-links a, .entry-categories a, [rel='category tag']")
-        category = normalize_text(cat_el.get_text()) if cat_el else "karachi"
+        q_text = _dedupe_lines(q_text)
+        a_text = _dedupe_lines(a_text)
 
-        # STEP 5: Date extraction.
-        date_str = None
-        date_el = soup.select_one(
-            "time.entry-date, time[datetime], .published, meta[property='article:published_time']"
-        )
-        if date_el:
-            date_str = date_el.get("datetime") or date_el.get("content") or None
-
-        # STEP 6: Quality check.
-        if len(q_text) < 10 or len(a_text) < 30:
+        if len(q_text.strip()) < 10:
             logger.debug(
-                "Karachi: skipping low-quality parse url=%s q=%d a=%d",
+                "Karachi: question too short url=%s q=%d",
                 url,
                 len(q_text),
+            )
+            return None
+
+        if len(a_text.strip()) < 30:
+            if pdf_url and not a_text:
+                logger.info(
+                    "Karachi: PDF has no extractable text (likely scanned image) url=%s pdf=%s",
+                    url,
+                    pdf_url,
+                )
+            else:
+                logger.debug(
+                    "Karachi: answer too short url=%s a=%d pdf=%s",
+                    url,
+                    len(a_text),
+                    pdf_url,
+                )
+            return None
+
+        if not _looks_readable_urdu(a_text):
+            logger.info(
+                "Karachi: PDF text is not readable Urdu; skipping url=%s pdf=%s chars=%d",
+                url,
+                pdf_url or "<none>",
                 len(a_text),
             )
             return None
 
+        logger.debug(
+            "Karachi parsed OK: url=%s cat=%s q=%d a=%d fatwa=%s",
+            url,
+            category,
+            len(q_text),
+            len(a_text),
+            fatwa_num,
+        )
+
         return ParsedFatwa(
             question=q_text,
             answer=a_text,
-            source="karachi",
+            source=SOURCE_NAME,
             url=canonical_url(url),
             category=category,
-            date=date_str or None,
+            date=date_text or None,
         )
 
-    def _parse_wp_api_post(self, post: dict) -> ParsedFatwa | None:
-        """Parse a post directly from WP REST API JSON — no HTML needed."""
-        title = normalize_text(str(post.get("title", {}).get("rendered", "")))
-        content_html = str(post.get("content", {}).get("rendered", ""))
-        content_soup = BeautifulSoup(content_html, "lxml")
+    def _extract_pdf_text(
+        self, pdf_url: str, client: PoliteHttpClient | None
+    ) -> str:
+        """Download PDF and extract text using pdfplumber."""
+        try:
+            import pdfplumber  # type: ignore
+        except ImportError:
+            logger.error("pdfplumber not installed. Run: pip install pdfplumber")
+            return ""
 
-        q_text, a_text = _split_sawal_jawab(content_soup)
-        if not q_text:
-            q_text = title
-        if not a_text:
-            a_text = normalize_text(content_soup.get_text())
+        try:
+            if client is not None:
+                r = client.get(pdf_url)
+            else:
+                import requests  # type: ignore
 
-        if len(q_text) < 10 or len(a_text) < 30:
-            return None
+                r = requests.get(pdf_url, timeout=30)
+            r.raise_for_status()
 
-        return ParsedFatwa(
-            question=q_text,
-            answer=a_text,
-            source="karachi",
-            url=normalize_text(str(post.get("link", ""))),
-            category="karachi",
-            date=normalize_text(str(post.get("date", ""))) or None,
-        )
+            with pdfplumber.open(io.BytesIO(r.content)) as pdf:
+                text_parts: list[str] = []
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text and text.strip():
+                        text_parts.append(text.strip())
+
+            return normalize_text("\n\n".join(text_parts))
+        except Exception as e:
+            logger.warning(
+                "Karachi PDF extract failed url=%s error=%s",
+                pdf_url,
+                e,
+            )
+            return ""
+
+    def _get_pdf_url(self, soup: BeautifulSoup, base_url: str) -> str:
+        """Extract PDF URL from iframe or direct link."""
+        iframe = soup.select_one("iframe[src*='viewer.html']")
+        if iframe is not None:
+            iframe_src = iframe.get("src", "")
+            match = _PDF_FILE_RE.search(iframe_src)
+            if match:
+                pdf_url = urllib.parse.unquote(match.group(1))
+                if pdf_url.startswith("http"):
+                    return pdf_url
+
+        pdf_link = soup.select_one("a[href*='.pdf']")
+        if pdf_link is not None:
+            href = pdf_link.get("href", "")
+            if href:
+                return urljoin(base_url, href)
+
+        for iframe in soup.find_all("iframe"):
+            src = iframe.get("src", "")
+            if "pdf" not in src.lower() and "files.darulifta" not in src:
+                continue
+            match = _PDF_FILE_RE.search(src)
+            if match:
+                pdf_url = urllib.parse.unquote(match.group(1))
+                if pdf_url:
+                    return urljoin(base_url, pdf_url)
+
+        return ""
 
 
-def _is_wp_post_link(url: str) -> bool:
-    p = urlparse(url)
-    if "darululoomkarachi.edu.pk" not in p.netloc.lower():
+def _strip_noise(soup: BeautifulSoup) -> None:
+    for tag in soup.select(_NOISE_SELECTOR):
+        tag.decompose()
+
+
+def _extract_question(soup: BeautifulSoup) -> str:
+    # User-confirmed selector. Some live pages currently render the same
+    # classes on a div, so keep that as the first fallback without changing
+    # the public behavior.
+    q_el = soup.select_one("h1.text-lg.font-bold") or soup.select_one("h1")
+    if q_el is None:
+        q_el = soup.select_one("div.text-lg.font-bold.leading-relaxed")
+    if q_el is None:
+        q_el = soup.select_one("main div.text-lg.font-bold")
+    q_text = normalize_text(q_el.get_text()) if q_el else ""
+
+    if len(q_text) < 10:
+        h4 = soup.select_one("h4")
+        if h4 is not None:
+            q_text = normalize_text(h4.get_text())
+
+    if len(q_text) < 10:
+        og = soup.find("meta", attrs={"property": "og:title"})
+        if og is not None:
+            q_text = normalize_text(og.get("content") or "")
+
+    return q_text
+
+
+def _extract_category(soup: BeautifulSoup) -> str:
+    section = soup.find("meta", attrs={"property": "article:section"})
+    if section is not None:
+        category = normalize_text(section.get("content") or "")
+        if category:
+            return category[:512]
+
+    for a in soup.select("main a[href*='/d/']"):
+        text = normalize_text(a.get_text())
+        if text and len(text) > 3 and "دار" not in text:
+            return text[:512]
+
+    return "karachi"
+
+
+def _extract_date(soup: BeautifulSoup) -> str:
+    pub = soup.find("meta", attrs={"property": "article:published_time"})
+    if pub is not None:
+        content = (pub.get("content") or "").strip()
+        if content:
+            return content[:32]
+
+    for span in soup.select("main span, main div.flex span"):
+        text = span.get_text(strip=True)
+        if _DATE_RE.search(text):
+            return text.strip()
+
+    return ""
+
+
+def _extract_fatwa_number(soup: BeautifulSoup) -> str:
+    match = _FATWA_NUMBER_RE.search(soup.get_text(" ", strip=True))
+    return match.group(1).strip() if match else ""
+
+
+def _dedupe_lines(text: str) -> str:
+    seen: set[str] = set()
+    result: list[str] = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if line and line not in seen:
+            seen.add(line)
+            result.append(line)
+    return "\n".join(result)
+
+
+def _looks_readable_urdu(text: str) -> bool:
+    """Reject pdfplumber glyph dumps before they reach the database.
+
+    Many Karachi PDFs are scanned images or use fonts without a usable Unicode
+    map. pdfplumber can still emit long strings, but they look like
+    ``J.,,..--`` / ``yl~I`` rather than Urdu. A valid answer should contain a
+    meaningful amount of Arabic-script text and not be dominated by Latin
+    glyph fragments.
+    """
+    compact = text.strip()
+    if len(compact) < 30:
         return False
-    blob = (p.path or "") + "?" + (p.query or "")
-    return bool(_WP_POST_LINK_RE.search(blob))
 
+    arabic_chars = len(_ARABIC_SCRIPT_RE.findall(compact))
+    latin_chars = len(_LATIN_RE.findall(compact))
+    alpha_chars = arabic_chars + latin_chars
+    if arabic_chars < 40:
+        return False
+    if alpha_chars and arabic_chars / alpha_chars < 0.45:
+        return False
+    if latin_chars > arabic_chars:
+        return False
 
-def _find_next_page_urls(soup: BeautifulSoup, current_url: str) -> list[str]:
-    out: list[str] = []
-    seen_local: set[str] = set()
-    for a in soup.select("a[href]"):
-        href = (a.get("href") or "").strip()
-        if not href or href.startswith("#"):
-            continue
-        text = normalize_text(a.get_text()).lower()
-        if not (
-            "اگلا" in text
-            or "next" in text
-            or ">>" in text
-            or re.search(r"[?&]paged=\d+", href, re.I)
-            or re.search(r"/page/\d+", href, re.I)
-        ):
-            continue
-        full = canonical_url(urljoin(current_url, href))
-        if full in seen_local:
-            continue
-        seen_local.add(full)
-        out.append(full)
-    return out
-
-
-def _split_sawal_jawab(root: Tag) -> tuple[str, str]:
-    q_parts: list[str] = []
-    a_parts: list[str] = []
-    mode: str | None = None
-    for el in root.find_all(["h1", "h2", "h3", "h4", "h5", "p", "div", "li", "td"]):
-        text = normalize_text(el.get_text())
-        if not text:
-            continue
-        if "سوال" in text and len(text) < 120:
-            mode = "q"
-            if len(text) > 10:
-                q_parts.append(text)
-            continue
-        if "جواب" in text and len(text) < 160:
-            mode = "a"
-            if len(text) > 10:
-                a_parts.append(text)
-            continue
-        if mode == "q":
-            q_parts.append(text)
-        elif mode == "a":
-            a_parts.append(text)
-    return normalize_text("\n".join(q_parts)), normalize_text("\n".join(a_parts))
+    return True

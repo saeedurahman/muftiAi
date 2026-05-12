@@ -59,7 +59,14 @@ def _to_subscription_out(sub: Subscription | None) -> SubscriptionOut | None:
 
 
 async def _ensure_trial(db: AsyncSession, user_id: int) -> AITrial:
-    row = (await db.execute(select(AITrial).where(AITrial.user_id == user_id))).scalar_one_or_none()
+    """Return one AI trial row per user; tolerate legacy duplicate rows in DB."""
+    stmt = (
+        select(AITrial)
+        .where(AITrial.user_id == user_id)
+        .order_by(AITrial.id.desc())
+        .limit(1)
+    )
+    row = (await db.execute(stmt)).scalars().first()
     if row is None:
         row = AITrial(user_id=user_id, used_count=0, max_count=3)
         db.add(row)

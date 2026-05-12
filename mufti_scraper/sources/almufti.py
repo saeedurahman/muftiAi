@@ -41,6 +41,30 @@ _A_PREFIXES: tuple[str, ...] = ("جواب:", "جواب")
 # typically follows).
 _A_END_MARKERS: tuple[str, ...] = ("واللہ اعلم", "والله أعلم")
 
+# Selectors and markers confirmed via browser inspection of
+# almuftionline.com fatwa permalinks (April 2026).
+_NOISE_SELECTOR = (
+    "header, footer, nav, .sidebar, #sidebar, "
+    ".social-share, .share-buttons, .post-navigation, "
+    ".related-posts, .comments-area, script, style, noscript"
+)
+
+# Answer-section start markers in priority order. The most-specific
+# (Bismillah-prefixed) form is checked first so we never split inside the
+# leading invocation.
+_ANSWER_MARKERS: tuple[str, ...] = (
+    "اَلجَوَابْ بِاسْمِ مُلْہِمِ الصَّوَابْ",
+    "اَلجَوَابُ",
+    "الجواب",
+    "جواب",
+    "اَلجَوَابْ",
+)
+
+_QUESTION_PREFIX_RE = re.compile(r"^سوال\s*[:：]?\s*")
+
+# Strict date+numeric-id post pattern used for collection-summary logging.
+_FATWA_POST_RE = re.compile(r"/\d{4}/\d{2}/\d{2}/\d+")
+
 
 def _abs(base: str, href: str) -> str:
     return canonical_url(urljoin(base, href))
@@ -65,13 +89,24 @@ class AlMuftiSource:
         except Exception as e:
             logger.warning("Al Mufti sitemap discovery failed: %s", e)
             sm_urls = []
+        sitemap_total = len(sm_urls)
         for u in sm_urls:
             if u in seen:
                 continue
             seen.add(u)
             out.append(u)
             if limit is not None and len(out) >= limit:
+                logger.info(
+                    "Al Mufti URL collection: sitemap=%d kept=%d (limit reached)",
+                    sitemap_total,
+                    len(out),
+                )
                 return out
+        logger.info(
+            "Al Mufti URL collection (sitemap phase): sitemap=%d kept=%d",
+            sitemap_total,
+            len(out),
+        )
 
         # Phase 2: archive walks. Picks up anything missing from the sitemap
         # (recent posts not yet indexed, custom permalinks, etc).
@@ -184,32 +219,78 @@ class AlMuftiSource:
 
     def parse_page(self, html: str, url: str) -> ParsedFatwa | None:
         soup = BeautifulSoup(html, "lxml")
+        # Strip site chrome and tracking widgets *before* any extraction so
+        # selectors below never see navigation / share / sidebar text.
+        _strip_noise(soup)
+
         title_el = soup.select_one("h1.entry-title, article h1, h1")
         title = normalize_text(title_el.get_text()) if title_el else ""
 
-        article = soup.select_one("article, .entry-content, main")
-        if not article:
-            article = soup.body
-        if not article:
-            return None
+        category = _category_from_table(soup) or _category_from_article(soup)
 
-        category = _category_from_article(soup)
-        # Fall back to the mufti name in the category slot when no topical
-        # category is present, so downstream search/filter still has a
-        # meaningful tag for the post.
+        # Mufti name is metadata for now; only used as a category fallback
+        # when no topical category is available, so downstream search/filter
+        # still has a meaningful tag for the post.
         if not category:
-            mufti = _extract_mufti_name(soup)
-            if mufti:
-                category = f"Mufti: {mufti}"
+            mufti_name = _mufti_name_from_table(soup) or _extract_mufti_name(soup)
+            if mufti_name:
+                category = f"Mufti: {mufti_name}"[:512]
+
         date = _date_from_meta(soup, url)
 
-        q_text, a_text = _split_sawal_jawab_wp(article)
-        if not q_text:
+        content_div = (
+            soup.select_one(".entry-content.pagelayer-post-excerpt > div:first-of-type")
+            or soup.select_one(".entry-content > div:first-of-type")
+            or soup.select_one(".entry-content")
+        )
+
+        q_text, a_text = "", ""
+        if content_div is not None:
+            q_text, a_text = _split_question_answer(content_div)
+
+        if q_text:
+            q_text = _QUESTION_PREFIX_RE.sub("", q_text).strip()
+
+        q_text = _dedupe_lines(q_text)
+        a_text = _dedupe_lines(a_text)
+
+        # Safety net: if the marker split was too thin, retry the legacy
+        # paragraph-walk parser scoped to the same content container.
+        if (
+            (len(q_text) < 20 or len(a_text) < 50)
+            and content_div is not None
+        ):
+            legacy_q, legacy_a = _split_sawal_jawab_wp(content_div)
+            legacy_q = _dedupe_lines(_QUESTION_PREFIX_RE.sub("", legacy_q).strip())
+            legacy_a = _dedupe_lines(legacy_a)
+            if len(legacy_q) >= 20 and len(legacy_a) >= 50:
+                q_text, a_text = legacy_q, legacy_a
+
+        if not q_text and title:
             q_text = title
-        if not a_text:
-            a_text = normalize_text(article.get_text())
-        if not a_text or len(a_text) < 40:
+
+        if (
+            not q_text
+            or not a_text
+            or len(q_text.strip()) < 20
+            or len(a_text.strip()) < 50
+            or q_text == a_text
+        ):
+            logger.debug(
+                "AlMufti parse failed: url=%s q_len=%d a_len=%d",
+                url,
+                len(q_text or ""),
+                len(a_text or ""),
+            )
             return None
+
+        logger.debug(
+            "AlMufti parsed OK: url=%s category=%s q_len=%d a_len=%d",
+            url,
+            category,
+            len(q_text),
+            len(a_text),
+        )
 
         return ParsedFatwa(
             question=q_text,
@@ -221,6 +302,12 @@ class AlMuftiSource:
         )
 
 
+def _strip_noise(soup: BeautifulSoup) -> None:
+    """Remove site chrome and widgets before any text extraction."""
+    for tag in soup.select(_NOISE_SELECTOR):
+        tag.decompose()
+
+
 def _category_from_article(soup: BeautifulSoup) -> str | None:
     for a in soup.select('a[rel="category tag"], .cat-links a, a[href*="/category/fatwa/"]'):
         t = normalize_text(a.get_text())
@@ -229,10 +316,102 @@ def _category_from_article(soup: BeautifulSoup) -> str | None:
     return None
 
 
+def _category_from_table(soup: BeautifulSoup) -> str | None:
+    """Read category / sub-category from the leading wp-block-table figure.
+
+    The header table on almuftionline posts has the shape::
+
+        | post-id | category | sub-category |
+
+    We combine category and sub-category with an em-dash when both are
+    present and distinct, otherwise return whichever exists.
+    """
+    cat_el = soup.select_one(
+        "figure.wp-block-table:first-of-type tr td:nth-child(2)"
+    )
+    sub_el = soup.select_one(
+        "figure.wp-block-table:first-of-type tr td:nth-child(3)"
+    )
+    cat = normalize_text(cat_el.get_text()) if cat_el else ""
+    sub = normalize_text(sub_el.get_text()) if sub_el else ""
+
+    if cat and sub and sub != cat:
+        combined = f"{cat} — {sub}"
+        return combined[:512]
+    if cat:
+        return cat[:512]
+    if sub:
+        return sub[:512]
+    return None
+
+
+def _mufti_name_from_table(soup: BeautifulSoup) -> str | None:
+    """Read the answering mufti from the trailing wp-block-table figure."""
+    el = soup.select_one(
+        "figure.wp-block-table:last-of-type tr:nth-child(1) td:nth-child(2)"
+    )
+    if el is None:
+        return None
+    name = normalize_text(el.get_text())
+    return name[:200] if name else None
+
+
+def _split_question_answer(content_div: Tag) -> tuple[str, str]:
+    """Split fatwa content into ``(question, answer)`` using known markers.
+
+    The fatwa post stores question and answer in a single block separated
+    by an Urdu/Arabic answer marker (e.g. ``الجواب``). We try the most
+    specific marker first so we never split inside the leading invocation,
+    and fall back to a 500-character heuristic if no marker is present.
+    """
+    full_text = normalize_text(content_div.get_text(separator="\n"))
+    if not full_text:
+        return "", ""
+
+    for marker in _ANSWER_MARKERS:
+        if marker in full_text:
+            head, tail = full_text.split(marker, 1)
+            q_text = normalize_text(head)
+            a_text = normalize_text(marker + tail)
+            return q_text, a_text
+
+    return normalize_text(full_text[:500]), normalize_text(full_text[500:])
+
+
+def _dedupe_lines(text: str) -> str:
+    """Drop duplicate non-empty lines while preserving original order."""
+    if not text:
+        return ""
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if line and line not in seen:
+            seen.add(line)
+            out.append(line)
+    return "\n".join(out)
+
+
 def _date_from_meta(soup: BeautifulSoup, url: str) -> str | None:
+    """Return ISO-day date for the post.
+
+    Order of preference:
+    1. ``<meta property='article:published_time'>`` (most reliable on WP).
+    2. ``<time datetime='...'>`` element if present.
+    3. Date segment embedded in the permalink path.
+    """
+    meta = soup.select_one("meta[property='article:published_time']")
+    if meta is not None:
+        content = meta.get("content") or ""
+        if isinstance(content, str) and len(content) >= 10:
+            return content[:10]
+
     t = soup.select_one("time[datetime]")
     if t and t.get("datetime"):
-        return t["datetime"][:10]
+        dt = t["datetime"]
+        if isinstance(dt, str) and len(dt) >= 10:
+            return dt[:10]
+
     m = re.search(r"/(\d{4})/(\d{2})/(\d{2})/", url)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
@@ -371,8 +550,20 @@ def _discover_via_sitemap(
             if _is_post_url(full):
                 out.append(full)
 
-    if out:
-        logger.info("Al Mufti sitemap: collected %d post urls", len(out))
+    raw = len(seen)
+    strict = sum(
+        1
+        for u in out
+        if _FATWA_POST_RE.search(urlparse(u).path or "")
+    )
+    logger.info(
+        "Al Mufti sitemap: %d urls discovered, %d kept as posts (%d filtered, "
+        "%d match strict /YYYY/MM/DD/<id> pattern)",
+        raw,
+        len(out),
+        raw - len(out),
+        strict,
+    )
     return out
 
 

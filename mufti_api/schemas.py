@@ -123,6 +123,18 @@ class QuestionAnswerUpdate(BaseModel):
     status: QuestionStatus = "answered"
 
 
+class UploadAnswerResponse(BaseModel):
+    question_id: int
+    extracted_length: int
+    status: str
+    preview: str
+    message: str
+
+
+class AnswerFromTextRequest(BaseModel):
+    answer_text: str = Field(min_length=1, max_length=500_000)
+
+
 class QuestionsPageResponse(BaseModel):
     items: list[QuestionOut] = Field(default_factory=list)
     page: int = Field(ge=1)
