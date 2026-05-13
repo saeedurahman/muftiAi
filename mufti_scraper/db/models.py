@@ -284,3 +284,33 @@ class MuftiPayment(Base):
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class ManualFatwa(Base):
+    """Admin/Mufti authored Q&A; optional mirror row in ``fatwas`` when published."""
+
+    __tablename__ = "manual_fatwas"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    source_name: Mapped[str] = mapped_column(String(200), default="Admin")
+    added_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    added_by_role: Mapped[str] = mapped_column(String(20))
+    pdf_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
+    fatwa_id: Mapped[int | None] = mapped_column(
+        ForeignKey("fatwas.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )

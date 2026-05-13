@@ -14,6 +14,7 @@ from fastapi import (
     APIRouter,
     Depends,
     File,
+    Form,
     Header,
     HTTPException,
     Query,
@@ -29,9 +30,12 @@ from mufti_scraper.cleaning import normalize_text
 from mufti_scraper.db.models import Question, SearchMiss
 
 from mufti_api.deps import get_db, verify_api_key
+from mufti_api.fatwa_insert import insert_searchable_fatwa
 from mufti_api.schemas import (
     AnswerFromTextRequest,
     QuestionAnswerUpdate,
+    QuestionAnswerWithCategoryRequest,
+    QuestionAnswerWithCategoryResponse,
     QuestionCreate,
     QuestionOut,
     SearchMissesPageResponse,
@@ -288,6 +292,7 @@ async def upload_question_answer(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     file: UploadFile = File(..., description="PDF or TXT, max 10MB"),
+    publish_as_fatwa: bool = Form(False),
     x_api_key: str | None = Header(None, alias="X-API-Key"),
     x_user_id: str | None = Header(None, alias="X-User-ID"),
 ) -> UploadAnswerResponse:
@@ -334,12 +339,30 @@ async def upload_question_answer(
     preview = final_text[:_PREVIEW_CHARS]
     if len(final_text) > _PREVIEW_CHARS:
         preview = preview + "..."
+
+    fatwa_id: int | None = None
+    if publish_as_fatwa:
+        fatwa_id = await insert_searchable_fatwa(
+            db,
+            question=row.question_text,
+            answer=final_text,
+            category=None,
+            source="Ask Mufti",
+            url=f"submission://{row.id}",
+        )
+        row.fatwa_id = fatwa_id
+        row.updated_at = datetime.now(timezone.utc)
+        await db.commit()
+        await db.refresh(row)
+
     return UploadAnswerResponse(
         question_id=row.id,
         extracted_length=len(final_text),
         status=row.status,
         preview=preview,
         message="Answer extracted and saved successfully",
+        publish_as_fatwa=publish_as_fatwa,
+        fatwa_id=fatwa_id,
     )
 
 
@@ -377,6 +400,63 @@ async def answer_question_from_text(
         status=row.status,
         preview=preview,
         message="Answer extracted and saved successfully",
+        publish_as_fatwa=False,
+        fatwa_id=None,
+    )
+
+
+@router.post(
+    "/questions/{question_id}/answer-with-category",
+    response_model=QuestionAnswerWithCategoryResponse,
+    summary="Answer question with category and optional publish to fatwas search",
+)
+async def answer_question_with_category(
+    question_id: int,
+    request: Request,
+    payload: QuestionAnswerWithCategoryRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    x_user_id: str | None = Header(None, alias="X-User-ID"),
+) -> QuestionAnswerWithCategoryResponse:
+    settings: Settings = request.app.state.settings
+    row = await _get_question_or_404(db, question_id)
+    _resolve_answer_writer(settings, row, x_api_key, x_user_id)
+
+    final_text = _finalize_extracted_text(payload.answer_text)
+    if len(final_text) < _MIN_ANSWER_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail="Answer text too short",
+        )
+
+    now = datetime.now(timezone.utc)
+    row.answer_text = final_text
+    row.status = "answered"
+    row.answered_at = now
+    row.updated_at = now
+
+    fatwa_id: int | None = None
+    if payload.publish_as_fatwa:
+        cat = (
+            payload.category.strip()[:512]
+            if payload.category and payload.category.strip()
+            else None
+        )
+        fatwa_id = await insert_searchable_fatwa(
+            db,
+            question=row.question_text,
+            answer=final_text,
+            category=cat,
+            source="Ask Mufti",
+            url=f"submission://{row.id}",
+        )
+        row.fatwa_id = fatwa_id
+
+    await db.commit()
+    await db.refresh(row)
+    return QuestionAnswerWithCategoryResponse(
+        question=QuestionOut.model_validate(row),
+        fatwa_id=fatwa_id,
     )
 
 

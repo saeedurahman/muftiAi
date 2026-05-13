@@ -12,12 +12,12 @@ import logging
 import os
 from datetime import timedelta
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Literal
 
 from cachetools import TTLCache
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import Select, func, or_, select, text
+from sqlalchemy import Select, and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from mufti_scraper.db.models import (
@@ -25,6 +25,8 @@ from mufti_scraper.db.models import (
     Fatwa,
     FatwaSummary,
     FatwaTranslation,
+    ManualFatwa,
+    Mufti,
     RelatedFatwaCache,
     SearchMiss,
     Subscription,
@@ -33,9 +35,14 @@ from mufti_scraper.db.models import (
 
 from mufti_api.database import get_session_factory
 from mufti_api.deps import get_db, verify_api_key
+from mufti_api.fatwa_insert import insert_searchable_fatwa
 from mufti_api.schemas import (
     CategoryCount,
+    CategoryDistinctItem,
     FatwaOut,
+    ManualFatwaCreate,
+    ManualFatwaOut,
+    ManualFatwasPageResponse,
     RelatedFatwaItem,
     RelatedFatwasOut,
     SearchResponse,
@@ -67,6 +74,62 @@ _STOP_WORDS = {
     "کی",
     "کے",
 }
+
+
+def _manual_row_source_name(
+    payload: ManualFatwaCreate,
+    *,
+    role: Literal["admin", "mufti"],
+    mufti_display: str | None,
+) -> str:
+    explicit = (payload.source_name or "").strip()
+    if explicit:
+        return explicit[:200]
+    if role == "admin":
+        return "Admin"
+    return ((mufti_display or "").strip() or "Mufti")[:200]
+
+
+def _manual_fatwa_search_source(payload: ManualFatwaCreate) -> str:
+    return ((payload.source_name or "").strip() or "Admin Entry")[:255]
+
+
+async def _persist_manual_fatwa(
+    db: AsyncSession,
+    payload: ManualFatwaCreate,
+    *,
+    actor: User,
+    role: Literal["admin", "mufti"],
+    mufti_display: str | None = None,
+) -> ManualFatwaOut:
+    row_src = _manual_row_source_name(payload, role=role, mufti_display=mufti_display)
+    cat = payload.category.strip()[:200] if payload.category and payload.category.strip() else None
+    pdf = payload.pdf_url.strip()[:500] if payload.pdf_url and payload.pdf_url.strip() else None
+    manual = ManualFatwa(
+        question=payload.question.strip(),
+        answer=payload.answer.strip(),
+        category=cat,
+        source_name=row_src,
+        added_by_user_id=actor.id,
+        added_by_role=role,
+        pdf_url=pdf,
+        status=payload.status,
+    )
+    db.add(manual)
+    await db.flush()
+    if payload.status == "published":
+        fid = await insert_searchable_fatwa(
+            db,
+            question=manual.question,
+            answer=manual.answer,
+            category=manual.category,
+            source=_manual_fatwa_search_source(payload),
+            url=f"manual://{manual.id}",
+        )
+        manual.fatwa_id = fid
+    await db.commit()
+    await db.refresh(manual)
+    return ManualFatwaOut.model_validate(manual)
 
 
 def _escape_like(pattern: str) -> str:
@@ -674,6 +737,119 @@ async def get_categories(
     )
     rows = (await db.execute(stmt)).all()
     return [CategoryCount(category=str(row[0]), count=int(row[1])) for row in rows]
+
+
+@router.get(
+    "/categories/all",
+    response_model=list[CategoryDistinctItem],
+    summary="All distinct categories for dropdown",
+)
+async def list_distinct_categories_all(
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[CategoryDistinctItem]:
+    stmt = (
+        select(Fatwa.category)
+        .where(Fatwa.category.is_not(None), Fatwa.category != "")
+        .distinct()
+        .order_by(Fatwa.category.asc())
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return [CategoryDistinctItem(category=str(c)) for c in rows]
+
+
+@router.post(
+    "/admin/fatwas/manual",
+    response_model=ManualFatwaOut,
+    summary="Create manual fatwa entry (admin)",
+)
+async def admin_create_manual_fatwa(
+    payload: ManualFatwaCreate,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _: Annotated[None, Depends(verify_api_key)],
+    x_user_id: str | None = Header(None, alias="X-User-ID"),
+) -> ManualFatwaOut:
+    if not x_user_id or not x_user_id.strip():
+        raise HTTPException(status_code=400, detail="Missing X-User-ID")
+    try:
+        uid = int(x_user_id.strip())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid X-User-ID") from e
+    user = (await db.execute(select(User).where(User.id == uid))).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return await _persist_manual_fatwa(db, payload, actor=user, role="admin")
+
+
+@router.post(
+    "/mufti/fatwas/manual",
+    response_model=ManualFatwaOut,
+    summary="Create manual fatwa entry (mufti)",
+)
+async def mufti_create_manual_fatwa(
+    payload: ManualFatwaCreate,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    x_user_id: str | None = Header(None, alias="X-User-ID"),
+) -> ManualFatwaOut:
+    if not x_user_id or not x_user_id.strip():
+        raise HTTPException(status_code=400, detail="Missing X-User-ID")
+    try:
+        uid = int(x_user_id.strip())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid X-User-ID") from e
+    user = (await db.execute(select(User).where(User.id == uid))).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.role != "mufti":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    mufti = (
+        await db.execute(select(Mufti).where(Mufti.user_id == user.id))
+    ).scalar_one_or_none()
+    if mufti is None:
+        raise HTTPException(status_code=404, detail="Mufti profile not found")
+    return await _persist_manual_fatwa(
+        db,
+        payload,
+        actor=user,
+        role="mufti",
+        mufti_display=mufti.display_name,
+    )
+
+
+@router.get(
+    "/admin/fatwas/manual",
+    response_model=ManualFatwasPageResponse,
+    summary="List manual fatwa entries (admin)",
+)
+async def admin_list_manual_fatwas(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _: Annotated[None, Depends(verify_api_key)],
+    status: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+) -> ManualFatwasPageResponse:
+    conds: list = []
+    if status and status.strip():
+        conds.append(ManualFatwa.status == status.strip())
+
+    count_stmt = select(func.count()).select_from(ManualFatwa)
+    if conds:
+        count_stmt = count_stmt.where(and_(*conds))
+    total = int((await db.execute(count_stmt)).scalar_one())
+
+    stmt = select(ManualFatwa)
+    if conds:
+        stmt = stmt.where(and_(*conds))
+    stmt = stmt.order_by(ManualFatwa.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    rows = (await db.execute(stmt)).scalars().all()
+
+    return ManualFatwasPageResponse(
+        items=[ManualFatwaOut.model_validate(r) for r in rows],
+        page=page,
+        page_size=page_size,
+        total=total,
+    )
 
 
 @router.get(

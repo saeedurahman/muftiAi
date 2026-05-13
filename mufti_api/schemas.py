@@ -84,6 +84,44 @@ class StatsResponse(BaseModel):
 QuestionStatus = Literal["pending", "reviewing", "answered", "published", "rejected"]
 QuestionPriority = Literal["normal", "high", "urgent"]
 UserRole = Literal["user", "admin", "mufti"]
+ManualFatwaStatus = Literal["draft", "published"]
+
+
+class ManualFatwaCreate(BaseModel):
+    question: str = Field(min_length=20, max_length=50_000)
+    answer: str = Field(min_length=50, max_length=500_000)
+    category: str | None = Field(default=None, max_length=200)
+    source_name: str | None = Field(default=None, max_length=200)
+    pdf_url: str | None = Field(default=None, max_length=500)
+    status: ManualFatwaStatus = "published"
+
+
+class ManualFatwaOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    question: str
+    answer: str
+    category: str | None = None
+    source_name: str
+    added_by_user_id: int
+    added_by_role: Literal["admin", "mufti"]
+    pdf_url: str | None = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    fatwa_id: int | None = None
+
+
+class ManualFatwasPageResponse(BaseModel):
+    items: list[ManualFatwaOut] = Field(default_factory=list)
+    page: int = Field(ge=1)
+    page_size: int = Field(ge=1, le=100)
+    total: int = Field(ge=0)
+
+
+class CategoryDistinctItem(BaseModel):
+    category: str
 
 
 class QuestionCreate(BaseModel):
@@ -113,6 +151,17 @@ class QuestionOut(BaseModel):
     updated_at: datetime
 
 
+class QuestionAnswerWithCategoryRequest(BaseModel):
+    answer_text: str = Field(min_length=50, max_length=500_000)
+    category: str | None = Field(default=None, max_length=512)
+    publish_as_fatwa: bool = True
+
+
+class QuestionAnswerWithCategoryResponse(BaseModel):
+    question: QuestionOut
+    fatwa_id: int | None = None
+
+
 class QuestionStatusUpdate(BaseModel):
     status: QuestionStatus
     admin_notes: str | None = None
@@ -129,6 +178,8 @@ class UploadAnswerResponse(BaseModel):
     status: str
     preview: str
     message: str
+    publish_as_fatwa: bool = False
+    fatwa_id: int | None = None
 
 
 class AnswerFromTextRequest(BaseModel):
